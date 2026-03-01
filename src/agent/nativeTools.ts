@@ -14,6 +14,7 @@ export type NativeToolDefinition = {
 
 export function createNativeToolDefinitions(
   workspacePath: string,
+  workspaceRoots: string[],
   processKiller: ProcessKiller,
 ): NativeToolDefinition[] {
   return [
@@ -54,9 +55,10 @@ export function createNativeToolDefinitions(
         properties: {
           path: { type: 'string' },
           depth: { type: 'number' },
+          workspaceRoot: { type: 'string' },
         },
       },
-      execute: async (input) => readDirectory(workspacePath, input),
+      execute: async (input) => readDirectory(workspacePath, workspaceRoots, input),
     },
   ];
 }
@@ -176,10 +178,42 @@ async function editFile(workspacePath: string, input: Record<string, unknown>): 
   );
 }
 
-async function readDirectory(workspacePath: string, input: Record<string, unknown>): Promise<string> {
+async function readDirectory(
+  workspacePath: string,
+  workspaceRoots: string[],
+  input: Record<string, unknown>,
+): Promise<string> {
   const target = String(input.path ?? '.');
   const depth = Math.max(0, Number(input.depth ?? 4));
-  const fullPath = path.isAbsolute(target) ? target : path.join(workspacePath, target);
+  const requestedWorkspaceRoot = input.workspaceRoot ? String(input.workspaceRoot) : undefined;
+
+  if ((target === '.' || target.trim() === '') && workspaceRoots.length > 1) {
+    const roots = requestedWorkspaceRoot
+      ? workspaceRoots.filter((root) => root === requestedWorkspaceRoot)
+      : workspaceRoots;
+
+    const workspaces = await Promise.all(
+      roots.map(async (rootPath) => ({
+        workspaceRoot: rootPath,
+        tree: await walkDirectory(rootPath, depth),
+      })),
+    );
+
+    return JSON.stringify(
+      {
+        kind: 'multi-root',
+        workspaceCount: workspaces.length,
+        workspaces,
+      },
+      null,
+      2,
+    );
+  }
+
+  const baseRoot = requestedWorkspaceRoot && workspaceRoots.includes(requestedWorkspaceRoot)
+    ? requestedWorkspaceRoot
+    : workspacePath;
+  const fullPath = path.isAbsolute(target) ? target : path.join(baseRoot, target);
 
   const tree = await walkDirectory(fullPath, depth);
   return JSON.stringify(tree, null, 2);

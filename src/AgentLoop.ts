@@ -4,9 +4,11 @@ import * as fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { McpStdioClient } from './agent/McpStdioClient';
 import { createNativeToolDefinitions, type NativeToolDefinition } from './agent/nativeTools';
+import { SessionManager } from './agent/SessionManager';
 import { HistoryTreeManager } from './HistoryTreeManager';
 import { ProcessKiller } from './ProcessKiller';
 import type {
+  AgentSession,
   AgentActionResult,
   ChatMessage,
   MCPConfigFile,
@@ -27,28 +29,40 @@ type ToolOutcome = {
   messageId: string;
 };
 
+type ConfigureModelOptions = {
+  strict?: boolean;
+};
+
 export class AgentLoop {
   private planningModel: AnyModel | undefined;
   private analysisModel: AnyModel | undefined;
   private preferredSmartModel = 'gpt-5.3-codex';
   private preferredFastModel = 'gemini-3-flash';
   private readonly sessionMessages = new Map<string, ChatMessage[]>();
+  private readonly sessionManager = new SessionManager();
   private readonly nodeSessionSnapshots = new Map<string, ChatMessage[]>();
   private readonly mcpClients = new Map<string, McpStdioClient>();
   private readonly onDidSessionChangeEmitter = new vscode.EventEmitter<{ sessionId: string; messages: ChatMessage[] }>();
+  private readonly onDidSessionsChangeEmitter = new vscode.EventEmitter<AgentSession[]>();
   private readonly nativeToolDefinitions: NativeToolDefinition[];
   private systemPromptTemplate: string | undefined;
   private nativeToolsRegistered = false;
 
   readonly onDidSessionChange = this.onDidSessionChangeEmitter.event;
+  readonly onDidSessionsChange = this.onDidSessionsChangeEmitter.event;
 
   constructor(
     private readonly workspacePath: string,
+    private readonly workspaceRoots: string[],
     private readonly extensionUri: vscode.Uri,
     private readonly historyTreeManager: HistoryTreeManager,
     private readonly processKiller: ProcessKiller,
   ) {
-    this.nativeToolDefinitions = createNativeToolDefinitions(this.workspacePath, this.processKiller);
+    this.nativeToolDefinitions = createNativeToolDefinitions(
+      this.workspacePath,
+      this.workspaceRoots,
+      this.processKiller,
+    );
   }
 
   async initialize(): Promise<void> {
@@ -59,11 +73,22 @@ export class AgentLoop {
     this.registerNativeToolsWithVsCodeLm();
   }
 
-  async configureModels(preferredSmartModel: string, preferredFastModel: string): Promise<void> {
+  async configureModels(
+    preferredSmartModel: string,
+    preferredFastModel: string,
+    options?: ConfigureModelOptions,
+  ): Promise<void> {
     this.preferredSmartModel = preferredSmartModel;
     this.preferredFastModel = preferredFastModel;
-    this.planningModel = await this.selectModel(this.preferredSmartModel);
-    this.analysisModel = await this.selectModel(this.preferredFastModel);
+    this.planningModel = await this.selectModel(this.preferredSmartModel, options?.strict === true);
+    this.analysisModel = await this.selectModel(this.preferredFastModel, options?.strict === true);
+  }
+
+  getActiveModelIds(): { smart?: string; fast?: string } {
+    return {
+      smart: this.planningModel?.id ?? this.planningModel?.name,
+      fast: this.analysisModel?.id ?? this.analysisModel?.name,
+    };
   }
 
   async listAvailableModels(): Promise<Array<{ id: string; name: string }>> {
@@ -79,6 +104,37 @@ export class AgentLoop {
     }));
   }
 
+  createSession(label = 'session'): AgentSession {
+    const session = this.sessionManager.createSession(label);
+    this.emitSessionsChange();
+    return session;
+  }
+
+  listSessions(): AgentSession[] {
+    return this.sessionManager.listSessions();
+  }
+
+  deleteSession(sessionId: string): void {
+    this.sessionManager.deleteSession(sessionId);
+    this.sessionMessages.delete(sessionId);
+    this.emitSessionsChange();
+    this.emitSessionChange(sessionId);
+  }
+
+  pruneNodeSnapshots(nodeIds: string[]): void {
+    for (const nodeId of nodeIds) {
+      this.nodeSessionSnapshots.delete(nodeId);
+    }
+  }
+
+  renameSession(sessionId: string, label: string): AgentSession | undefined {
+    const renamed = this.sessionManager.renameSession(sessionId, label);
+    if (renamed) {
+      this.emitSessionsChange();
+    }
+    return renamed;
+  }
+
   getSessionMessages(sessionId: string): ChatMessage[] {
     return this.cloneMessages(this.sessionMessages.get(sessionId) ?? []);
   }
@@ -91,6 +147,7 @@ export class AgentLoop {
       Array.from(this.nodeSessionSnapshots.entries()).map(([nodeId, messages]) => [nodeId, this.cloneMessages(messages)]),
     );
     return {
+      sessions: this.sessionManager.exportState(),
       sessionMessages,
       nodeSessionSnapshots,
     };
@@ -99,8 +156,11 @@ export class AgentLoop {
   importState(state: PersistedAgentLoopState): void {
     this.sessionMessages.clear();
     this.nodeSessionSnapshots.clear();
+    this.sessionManager.importState(state.sessions ?? []);
+    this.emitSessionsChange();
 
     for (const [sessionId, messages] of Object.entries(state.sessionMessages ?? {})) {
+      this.sessionManager.ensureSession(sessionId);
       this.sessionMessages.set(sessionId, this.cloneMessages(messages ?? []));
     }
     for (const [nodeId, messages] of Object.entries(state.nodeSessionSnapshots ?? {})) {
@@ -117,6 +177,12 @@ export class AgentLoop {
       await this.initialize();
     }
 
+    const sessionWasMissing = !this.sessionManager.hasSession(sessionId);
+    this.sessionManager.ensureSession(sessionId);
+    if (sessionWasMissing) {
+      this.emitSessionsChange();
+    }
+    this.historyTreeManager.setActiveSession(sessionId);
     const messages = this.sessionMessages.get(sessionId) ?? [];
     const userMessage: ChatMessage = {
       role: 'user',
@@ -158,6 +224,9 @@ export class AgentLoop {
         requestedCalls.push(...parsed.calls);
       }
 
+      requestedCalls.push(...this.extractToolCalls(response));
+      const dedupedCalls = this.dedupeCalls(requestedCalls);
+
       const tokenUsage = this.readTokenUsage(response);
       totalUsed += tokenUsage.used;
       totalLimit = Math.max(totalLimit, tokenUsage.limit);
@@ -175,9 +244,10 @@ export class AgentLoop {
       const baseHash = (await this.historyTreeManager.createCheckpoint({
         reason: `model-turn-${step}-before-tools`,
         actionLabel: 'Model turn start',
-      })).gitHash;
+      }, undefined, sessionId)).gitHash;
 
       const modelNode = this.historyTreeManager.addNode({
+        sessionId,
         messageId: assistantMessage.messageId,
         gitHash: baseHash,
         tokenUsage,
@@ -186,8 +256,9 @@ export class AgentLoop {
       });
       this.nodeSessionSnapshots.set(modelNode.id, this.cloneMessages(messages));
 
-      if (requestedCalls.length === 0) {
+      if (dedupedCalls.length === 0) {
         this.sessionMessages.set(sessionId, this.cloneMessages(messages));
+        this.sessionManager.touchSession(sessionId);
         this.emitSessionChange(sessionId);
         return {
           outputText: finalText,
@@ -196,21 +267,22 @@ export class AgentLoop {
         };
       }
 
-      for (const requestedCall of requestedCalls) {
+      for (const requestedCall of dedupedCalls) {
         const beforeNode = await this.historyTreeManager.createCheckpoint({
           reason: `before-${this.callLabel(requestedCall)}`,
           actionLabel: `Before ${this.callLabel(requestedCall)}`,
-        });
+        }, undefined, sessionId);
 
         const toolOutcome = await this.executeRequestedCall(requestedCall);
 
         const afterNode = await this.historyTreeManager.createCheckpoint({
           reason: `after-${this.callLabel(requestedCall)}`,
           actionLabel: `After ${this.callLabel(requestedCall)}`,
-        }, beforeNode.id);
+        }, beforeNode.id, sessionId);
 
         const actionKind = this.isNativeCall(requestedCall) ? 'tool' : 'mcp';
         const actionNode = this.historyTreeManager.addNode({
+          sessionId,
           messageId: toolOutcome.messageId,
           gitHash: afterNode.gitHash,
           parentId: afterNode.id,
@@ -230,6 +302,7 @@ export class AgentLoop {
     }
 
     this.sessionMessages.set(sessionId, this.cloneMessages(messages));
+    this.sessionManager.touchSession(sessionId);
     this.emitSessionChange(sessionId);
     return {
       outputText: finalText,
@@ -239,6 +312,12 @@ export class AgentLoop {
   }
 
   async rewindToNode(sessionId: string, nodeId: string): Promise<ChatMessage[]> {
+    const sessionWasMissing = !this.sessionManager.hasSession(sessionId);
+    this.sessionManager.ensureSession(sessionId);
+    if (sessionWasMissing) {
+      this.emitSessionsChange();
+    }
+    this.historyTreeManager.setActiveSession(sessionId);
     const lineage = this.historyTreeManager.jumpToNode(nodeId);
     const node = lineage[lineage.length - 1];
     if (node) {
@@ -248,6 +327,7 @@ export class AgentLoop {
     if (snapshot) {
       const cloned = this.cloneMessages(snapshot);
       this.sessionMessages.set(sessionId, cloned);
+      this.sessionManager.touchSession(sessionId);
       this.emitSessionChange(sessionId);
       return cloned;
     }
@@ -256,6 +336,7 @@ export class AgentLoop {
     const truncated = this.historyTreeManager.truncateMessagesForNode(nodeId, existing);
     const cloned = this.cloneMessages(truncated);
     this.sessionMessages.set(sessionId, cloned);
+    this.sessionManager.touchSession(sessionId);
     this.emitSessionChange(sessionId);
     return cloned;
   }
@@ -271,11 +352,15 @@ export class AgentLoop {
     });
   }
 
+  private emitSessionsChange(): void {
+    this.onDidSessionsChangeEmitter.fire(this.listSessions());
+  }
+
   private cloneMessages(messages: ChatMessage[]): ChatMessage[] {
     return messages.map((message) => ({ ...message }));
   }
 
-  private async selectModel(preferredModelId: string): Promise<AnyModel> {
+  private async selectModel(preferredModelId: string, strict = false): Promise<AnyModel> {
     const lmAny = vscode.lm as any;
     const selectors = [
       { id: preferredModelId },
@@ -284,12 +369,21 @@ export class AgentLoop {
       {},
     ];
 
+    let fallbackModel: AnyModel | undefined;
+
     for (const selector of selectors) {
       const models = await lmAny.selectChatModels(selector);
       if (Array.isArray(models) && models.length > 0) {
         const exact = models.find((m: AnyModel) => [m.id, m.name].includes(preferredModelId));
-        return exact ?? models[0];
+        if (exact) {
+          return exact;
+        }
+        fallbackModel ??= models[0];
       }
+    }
+
+    if (!strict && fallbackModel) {
+      return fallbackModel;
     }
 
     throw new Error(`No chat model available for selector: ${preferredModelId}`);
@@ -328,26 +422,93 @@ export class AgentLoop {
           ? chunk.value
           : '';
 
-    const calls: Array<NativeToolCall | MCPToolCall> = [];
-    const rawCalls = Array.isArray(chunk.toolCalls)
-      ? chunk.toolCalls
-      : Array.isArray(chunk.calls)
-        ? chunk.calls
-        : [];
-
-    const nativeToolNames = new Set(this.nativeToolDefinitions.map((tool) => tool.name));
-    for (const rawCall of rawCalls) {
-      const name = String(rawCall?.name ?? '');
-      const input = (rawCall?.input ?? rawCall?.arguments ?? {}) as Record<string, unknown>;
-      if (nativeToolNames.has(name as NativeToolCall['name'])) {
-        calls.push({ name, input } as NativeToolCall);
-      } else if (name.includes('.')) {
-        const [server, toolName] = name.split('.', 2);
-        calls.push({ server, name: toolName, input });
-      }
-    }
+    const calls = this.extractToolCalls(chunk);
 
     return { text, calls };
+  }
+
+  private extractToolCalls(source: any): Array<NativeToolCall | MCPToolCall> {
+    const calls: Array<NativeToolCall | MCPToolCall> = [];
+    const nativeToolNames = new Set(this.nativeToolDefinitions.map((tool) => tool.name));
+
+    const visit = (value: any, depth: number): void => {
+      if (depth > 6 || value == null) {
+        return;
+      }
+
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          visit(item, depth + 1);
+        }
+        return;
+      }
+
+      if (typeof value !== 'object') {
+        return;
+      }
+
+      const maybeName = typeof value.name === 'string'
+        ? value.name
+        : typeof value.toolName === 'string'
+          ? value.toolName
+          : typeof value.function?.name === 'string'
+            ? value.function.name
+            : undefined;
+
+      if (maybeName) {
+        const rawInput = value.input
+          ?? value.arguments
+          ?? value.args
+          ?? value.function?.arguments
+          ?? {};
+
+        let parsedInput: Record<string, unknown>;
+        if (typeof rawInput === 'string') {
+          try {
+            parsedInput = JSON.parse(rawInput) as Record<string, unknown>;
+          } catch {
+            parsedInput = { raw: rawInput };
+          }
+        } else {
+          parsedInput = (rawInput ?? {}) as Record<string, unknown>;
+        }
+
+        if (nativeToolNames.has(maybeName as NativeToolCall['name'])) {
+          calls.push({ name: maybeName as NativeToolCall['name'], input: parsedInput });
+        } else if (maybeName.includes('.')) {
+          const [server, toolName] = maybeName.split('.', 2);
+          calls.push({ server, name: toolName, input: parsedInput });
+        }
+      }
+
+      for (const key of Object.keys(value)) {
+        if (['name', 'toolName', 'input', 'arguments', 'args', 'function'].includes(key)) {
+          continue;
+        }
+        visit(value[key], depth + 1);
+      }
+    };
+
+    visit(source, 0);
+    return calls;
+  }
+
+  private dedupeCalls(calls: Array<NativeToolCall | MCPToolCall>): Array<NativeToolCall | MCPToolCall> {
+    const seen = new Set<string>();
+    const unique: Array<NativeToolCall | MCPToolCall> = [];
+
+    for (const call of calls) {
+      const key = this.isNativeCall(call)
+        ? `${call.name}:${JSON.stringify(call.input ?? {})}`
+        : `${call.server}.${call.name}:${JSON.stringify(call.input ?? {})}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      unique.push(call);
+    }
+
+    return unique;
   }
 
   private readTokenUsage(response: any): TokenUsage {

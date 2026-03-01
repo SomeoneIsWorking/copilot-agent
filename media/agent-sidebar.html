@@ -6,39 +6,43 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <style>
     body { margin: 0; padding: 8px; font-family: var(--vscode-font-family); }
-    .top { display: grid; grid-template-columns: 1fr; gap: 6px; margin-bottom: 8px; }
-    .modelGrid { display: grid; grid-template-columns: 1fr; gap: 6px; }
-    .modelRow { display: grid; grid-template-columns: 92px 1fr; gap: 6px; align-items: center; }
-    .modelRow input { width: 100%; box-sizing: border-box; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: 4px; padding: 6px; }
     .messages { border: 1px solid var(--vscode-panel-border); border-radius: 6px; height: 240px; overflow: auto; padding: 8px; margin-bottom: 8px; }
     .msg { margin-bottom: 8px; padding: 8px; border-radius: 6px; white-space: pre-wrap; }
     .user { background: var(--vscode-editor-inactiveSelectionBackground); }
     .assistant { background: var(--vscode-sideBar-background); border: 1px solid var(--vscode-panel-border); }
     textarea { width: 100%; min-height: 78px; resize: vertical; box-sizing: border-box; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: 6px; padding: 8px; }
-    .row { display: grid; grid-template-columns: 1fr auto auto; gap: 6px; margin-top: 6px; }
+    .row { display: grid; grid-template-columns: auto 1fr auto auto; gap: 6px; margin-top: 6px; align-items: center; }
     button { border: none; border-radius: 4px; padding: 6px 10px; cursor: pointer; background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
     button.secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+    .modelBtn { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .popoverAnchor { position: relative; }
+    .popover { position: absolute; z-index: 10; top: 32px; left: 0; width: 330px; background: var(--vscode-editorWidget-background); border: 1px solid var(--vscode-widget-border); border-radius: 6px; padding: 8px; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25); display: none; }
+    .popover.open { display: block; }
+    .modelRow { display: grid; grid-template-columns: 48px 1fr; gap: 6px; align-items: center; margin-bottom: 6px; }
+    .modelRow:last-child { margin-bottom: 0; }
+    .modelRow label { font-size: 11px; opacity: 0.85; }
+    select.compact { width: 100%; height: 26px; font-size: 12px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: 4px; }
     .status { font-size: 12px; opacity: 0.8; margin-bottom: 6px; }
   </style>
 </head>
 <body>
-  <div class="top">
-    <div class="modelGrid">
-      <div class="modelRow">
-        <label for="smartModel">Smart</label>
-        <input id="smartModel" type="text" placeholder="__DEFAULT_SMART_MODEL__" />
-      </div>
-      <div class="modelRow">
-        <label for="fastModel">Fast</label>
-        <input id="fastModel" type="text" placeholder="__DEFAULT_FAST_MODEL__" />
-      </div>
-      <button id="saveModels" class="secondary">Apply Models</button>
-    </div>
-  </div>
   <div id="status" class="status">Stopped</div>
   <div id="messages" class="messages"></div>
   <textarea id="prompt" placeholder="Ask the agent to inspect files, run tools, and edit code..."></textarea>
   <div class="row">
+    <div class="popoverAnchor">
+      <button id="modelPickerBtn" class="secondary modelBtn" title="Choose Smart/Fast models">Loading...</button>
+      <div id="modelPopover" class="popover" role="dialog" aria-label="Model selection">
+        <div class="modelRow">
+          <label for="fastModel">Fast</label>
+          <select id="fastModel" class="compact"></select>
+        </div>
+        <div class="modelRow">
+          <label for="smartModel">Smart</label>
+          <select id="smartModel" class="compact"></select>
+        </div>
+      </div>
+    </div>
     <div></div>
     <button id="send">Send</button>
     <button id="stop" class="secondary">Hard Stop</button>
@@ -48,9 +52,59 @@
     const vscode = acquireVsCodeApi();
     const messagesEl = document.getElementById('messages');
     const promptEl = document.getElementById('prompt');
+    const modelPickerBtn = document.getElementById('modelPickerBtn');
+    const modelPopoverEl = document.getElementById('modelPopover');
     const smartModelEl = document.getElementById('smartModel');
     const fastModelEl = document.getElementById('fastModel');
     const statusEl = document.getElementById('status');
+    let knownModelOptions = [];
+    let currentSmartModel = '';
+    let currentFastModel = '';
+    let modelValuesReady = false;
+
+    function renderModelButtonLabel() {
+      if (!modelValuesReady) {
+        modelPickerBtn.textContent = 'Loading...';
+        modelPickerBtn.title = 'Loading model selections';
+        return;
+      }
+
+      const fast = (currentFastModel || fastModelEl.value || '<fast-model-id>').trim();
+      const smart = (currentSmartModel || smartModelEl.value || '<smart-model-id>').trim();
+      modelPickerBtn.textContent = fast + '/' + smart;
+      modelPickerBtn.title = fast + '/' + smart;
+    }
+
+    function setSelectOptions(selectEl, options, selectedValue) {
+      let fallbackOptions = options.length > 0 ? [...options] : [];
+      if (selectedValue && !fallbackOptions.some((option) => option.id === selectedValue)) {
+        fallbackOptions.unshift({ id: selectedValue, name: selectedValue });
+      }
+      if (fallbackOptions.length === 0) {
+        fallbackOptions = [{ id: '__unknown__', name: 'No models' }];
+      }
+      selectEl.innerHTML = '';
+      for (const option of fallbackOptions) {
+        const el = document.createElement('option');
+        el.value = option.id;
+        el.textContent = option.name;
+        selectEl.appendChild(el);
+      }
+      const hasSelected = fallbackOptions.some((option) => option.id === selectedValue);
+      selectEl.value = hasSelected ? selectedValue : fallbackOptions[0].id;
+    }
+
+    function saveModels() {
+      currentSmartModel = (smartModelEl.value || '').trim();
+      currentFastModel = (fastModelEl.value || '').trim();
+      modelValuesReady = Boolean(currentSmartModel) && Boolean(currentFastModel);
+      vscode.postMessage({
+        type: 'saveModels',
+        smartModel: currentSmartModel,
+        fastModel: currentFastModel,
+      });
+      renderModelButtonLabel();
+    }
 
     function resetMessages() {
       messagesEl.innerHTML = '';
@@ -82,12 +136,18 @@
       vscode.postMessage({ type: 'hardStop' });
     });
 
-    document.getElementById('saveModels').addEventListener('click', () => {
-      vscode.postMessage({
-        type: 'saveModels',
-        smartModel: (smartModelEl.value || '').trim(),
-        fastModel: (fastModelEl.value || '').trim(),
-      });
+    modelPickerBtn.addEventListener('click', () => {
+      modelPopoverEl.classList.toggle('open');
+    });
+
+    smartModelEl.addEventListener('change', saveModels);
+    fastModelEl.addEventListener('change', saveModels);
+
+    document.addEventListener('click', (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      if (target.closest('.popoverAnchor')) return;
+      modelPopoverEl.classList.remove('open');
     });
 
     window.addEventListener('message', (event) => {
@@ -99,8 +159,30 @@
         statusEl.textContent = msg.state === 'thinking' ? 'Running' : 'Stopped';
       }
       if (msg?.type === 'modelPrefs') {
-        smartModelEl.value = String(msg.smartModel || '');
-        fastModelEl.value = String(msg.fastModel || '');
+        const smart = String(msg.smartModel || '');
+        const fast = String(msg.fastModel || '');
+        currentSmartModel = smart;
+        currentFastModel = fast;
+        modelValuesReady = Boolean(currentSmartModel) && Boolean(currentFastModel);
+        setSelectOptions(smartModelEl, knownModelOptions, smart);
+        setSelectOptions(fastModelEl, knownModelOptions, fast);
+        renderModelButtonLabel();
+      }
+      if (msg?.type === 'modelOptions') {
+        const options = Array.isArray(msg.options) ? msg.options : [];
+        knownModelOptions = options
+          .filter((entry) => entry && typeof entry.id === 'string')
+          .map((entry) => ({ id: String(entry.id), name: String(entry.name || entry.id) }));
+        setSelectOptions(smartModelEl, knownModelOptions, currentSmartModel || smartModelEl.value || '__unknown__');
+        setSelectOptions(fastModelEl, knownModelOptions, currentFastModel || fastModelEl.value || '__unknown__');
+        if (smartModelEl.value && smartModelEl.value !== '__unknown__') {
+          currentSmartModel = smartModelEl.value;
+        }
+        if (fastModelEl.value && fastModelEl.value !== '__unknown__') {
+          currentFastModel = fastModelEl.value;
+        }
+        modelValuesReady = Boolean(currentSmartModel) && Boolean(currentFastModel);
+        renderModelButtonLabel();
       }
       if (msg?.type === 'replaceMessages') {
         resetMessages();

@@ -5,16 +5,26 @@ import { randomUUID } from 'node:crypto';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import * as fs from 'node:fs/promises';
-import type { ChatMessage, CheckpointMetadata, HistoryNode, PersistedHistoryState, TokenUsage } from './types';
+import type { AgentSession, ChatMessage, CheckpointMetadata, HistoryNode, PersistedHistoryState, TokenUsage } from './types';
 
 const execFileAsync = promisify(execFile);
 
-export class HistoryTreeManager implements vscode.TreeDataProvider<HistoryNode> {
+type SessionTreeItem = {
+  kind: 'session';
+  sessionId: string;
+  label: string;
+};
+
+type HistoryTreeItem = HistoryNode | SessionTreeItem;
+
+export class HistoryTreeManager implements vscode.TreeDataProvider<HistoryTreeItem> {
   private readonly nodes = new Map<string, HistoryNode>();
   private readonly roots: string[] = [];
-  private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<HistoryNode | undefined>();
+  private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<HistoryTreeItem | undefined>();
   private readonly shadowRef = 'refs/heads/agent-shadow';
-  private headId: string | undefined;
+  private readonly headBySession = new Map<string, string>();
+  private readonly sessionLabels = new Map<string, string>();
+  private activeSessionId = 'default';
 
   readonly onDidChangeTreeData = this.onDidChangeTreeDataEmitter.event;
 
@@ -25,12 +35,96 @@ export class HistoryTreeManager implements vscode.TreeDataProvider<HistoryNode> 
     await this.ensureShadowBranchExists();
   }
 
-  async createCheckpoint(metadata: CheckpointMetadata, parentId?: string): Promise<HistoryNode> {
+  setActiveSession(sessionId: string): void {
+    this.activeSessionId = sessionId;
+    this.onDidChangeTreeDataEmitter.fire(undefined);
+  }
+
+  setSessionMetadata(sessions: AgentSession[]): void {
+    this.sessionLabels.clear();
+    for (const session of sessions) {
+      this.sessionLabels.set(session.id, session.label);
+    }
+    this.onDidChangeTreeDataEmitter.fire(undefined);
+  }
+
+  deleteSession(sessionId: string): void {
+    const toDelete = Array.from(this.nodes.values())
+      .filter((node) => node.sessionId === sessionId)
+      .map((node) => node.id);
+
+    const deleteSet = new Set(toDelete);
+    for (const node of this.nodes.values()) {
+      node.childrenIds = node.childrenIds.filter((id) => !deleteSet.has(id));
+    }
+    for (const nodeId of toDelete) {
+      this.nodes.delete(nodeId);
+    }
+
+    const remainingRoots = this.roots.filter((rootId) => {
+      const node = this.nodes.get(rootId);
+      return !!node && node.sessionId !== sessionId;
+    });
+    this.roots.splice(0, this.roots.length, ...remainingRoots);
+
+    this.headBySession.delete(sessionId);
+    this.sessionLabels.delete(sessionId);
+    if (this.activeSessionId === sessionId) {
+      this.activeSessionId = this.headBySession.keys().next().value as string ?? 'default';
+    }
+    this.onDidChangeTreeDataEmitter.fire(undefined);
+  }
+
+  deleteNodeSubtree(nodeId: string): string[] {
+    const rootNode = this.nodes.get(nodeId);
+    if (!rootNode) {
+      return [];
+    }
+
+    const toDelete: string[] = [];
+    const walk = (id: string) => {
+      const node = this.nodes.get(id);
+      if (!node) {
+        return;
+      }
+      toDelete.push(id);
+      for (const childId of node.childrenIds) {
+        walk(childId);
+      }
+    };
+    walk(nodeId);
+
+    const deleteSet = new Set(toDelete);
+    for (const node of this.nodes.values()) {
+      node.childrenIds = node.childrenIds.filter((childId) => !deleteSet.has(childId));
+    }
+
+    const rootIndex = this.roots.indexOf(nodeId);
+    if (rootIndex >= 0) {
+      this.roots.splice(rootIndex, 1);
+    }
+
+    for (const id of toDelete) {
+      this.nodes.delete(id);
+    }
+
+    this.recomputeSessionHeads(rootNode.sessionId);
+    if (!this.headBySession.has(this.activeSessionId)) {
+      this.activeSessionId = this.headBySession.keys().next().value as string ?? 'default';
+    }
+
+    this.onDidChangeTreeDataEmitter.fire(undefined);
+    return toDelete;
+  }
+
+  async createCheckpoint(metadata: CheckpointMetadata, parentId?: string, sessionId = this.activeSessionId): Promise<HistoryNode> {
+    const parent = parentId ?? this.headBySession.get(sessionId);
     const hash = await this.captureSnapshotToShadowRef(metadata.reason);
     const node = this.addNode({
+      sessionId,
       messageId: randomUUID(),
       gitHash: hash,
-      parentId: parentId ?? this.headId,
+      parentId: parent,
       tokenUsage: { used: 0, limit: 1 },
       actionKind: 'checkpoint',
       actionLabel: metadata.actionLabel,
@@ -39,6 +133,7 @@ export class HistoryTreeManager implements vscode.TreeDataProvider<HistoryNode> 
   }
 
   addNode(input: {
+    sessionId?: string;
     messageId: string;
     gitHash: string;
     parentId?: string;
@@ -47,8 +142,10 @@ export class HistoryTreeManager implements vscode.TreeDataProvider<HistoryNode> 
     actionLabel: string;
   }): HistoryNode {
     const id = randomUUID();
+    const sessionId = input.sessionId ?? this.activeSessionId;
     const node: HistoryNode = {
       id,
+      sessionId,
       messageId: input.messageId,
       gitHash: input.gitHash,
       parentId: input.parentId,
@@ -65,18 +162,23 @@ export class HistoryTreeManager implements vscode.TreeDataProvider<HistoryNode> 
       if (!parent) {
         throw new Error(`Unknown parent node: ${node.parentId}`);
       }
+      if (parent.sessionId !== sessionId) {
+        throw new Error(`Cross-session parent linkage is not allowed: ${parent.sessionId} -> ${sessionId}`);
+      }
       parent.childrenIds.push(node.id);
     } else {
       this.roots.push(node.id);
     }
 
-    this.headId = node.id;
+    this.headBySession.set(sessionId, node.id);
+    this.activeSessionId = sessionId;
     this.onDidChangeTreeDataEmitter.fire(undefined);
     return node;
   }
 
-  getCurrentNode(): HistoryNode | undefined {
-    return this.headId ? this.nodes.get(this.headId) : undefined;
+  getCurrentNode(sessionId = this.activeSessionId): HistoryNode | undefined {
+    const headId = this.headBySession.get(sessionId);
+    return headId ? this.nodes.get(headId) : undefined;
   }
 
   getNode(nodeId: string): HistoryNode | undefined {
@@ -94,10 +196,12 @@ export class HistoryTreeManager implements vscode.TreeDataProvider<HistoryNode> 
   }
 
   jumpToNode(nodeId: string): HistoryNode[] {
-    if (!this.nodes.has(nodeId)) {
+    const node = this.nodes.get(nodeId);
+    if (!node) {
       throw new Error(`Unknown node: ${nodeId}`);
     }
-    this.headId = nodeId;
+    this.activeSessionId = node.sessionId;
+    this.headBySession.set(node.sessionId, nodeId);
     this.onDidChangeTreeDataEmitter.fire(undefined);
     return this.getLineage(nodeId);
   }
@@ -112,7 +216,21 @@ export class HistoryTreeManager implements vscode.TreeDataProvider<HistoryNode> 
     await this.runGit(['clean', '-fd']);
   }
 
-  getTreeItem(element: HistoryNode): vscode.TreeItem {
+  getTreeItem(element: HistoryTreeItem): vscode.TreeItem {
+    if (this.isSessionItem(element)) {
+      const roots = this.getSessionRoots(element.sessionId);
+      const item = new vscode.TreeItem(
+        element.label,
+        roots.length > 0
+          ? vscode.TreeItemCollapsibleState.Expanded
+          : vscode.TreeItemCollapsibleState.None,
+      );
+      item.description = `${roots.length} root ${roots.length === 1 ? 'branch' : 'branches'}`;
+      item.tooltip = `Session: ${element.sessionId}`;
+      item.contextValue = 'timelineSession';
+      return item;
+    }
+
     const fullness = element.tokenUsage.limit <= 0
       ? 0
       : Math.max(0, Math.min(1, element.tokenUsage.used / element.tokenUsage.limit));
@@ -128,24 +246,25 @@ export class HistoryTreeManager implements vscode.TreeDataProvider<HistoryNode> 
         : vscode.TreeItemCollapsibleState.None,
     );
     item.description = `${element.actionKind} ${bar}`;
-    item.tooltip = `Node: ${element.id}\nMessageID: ${element.messageId}\nGit: ${element.gitHash}\nTokens: ${element.tokenUsage.used}/${element.tokenUsage.limit}`;
+    item.tooltip = `Session: ${element.sessionId}\nNode: ${element.id}\nMessageID: ${element.messageId}\nGit: ${element.gitHash}\nTokens: ${element.tokenUsage.used}/${element.tokenUsage.limit}`;
     item.contextValue = 'timelineNode';
-    item.command = {
-      command: 'branchingTimeline.rewindToNode',
-      title: 'Rewind to Node',
-      arguments: [element],
-    };
     return item;
   }
 
-  getChildren(element?: HistoryNode): Thenable<HistoryNode[]> {
+  getChildren(element?: HistoryTreeItem): Thenable<HistoryTreeItem[]> {
     if (!element) {
-      return Promise.resolve(this.roots.map((id) => this.nodes.get(id)).filter((v): v is HistoryNode => !!v));
+      return Promise.resolve(this.getSessionItems());
     }
+
+    if (this.isSessionItem(element)) {
+      return Promise.resolve(this.getSessionRoots(element.sessionId));
+    }
+
     return Promise.resolve(element.childrenIds.map((id) => this.nodes.get(id)).filter((v): v is HistoryNode => !!v));
   }
 
   exportState(): PersistedHistoryState {
+    const headBySession = Object.fromEntries(this.headBySession.entries());
     return {
       nodes: Array.from(this.nodes.values()).map((node) => ({
         ...node,
@@ -153,7 +272,8 @@ export class HistoryTreeManager implements vscode.TreeDataProvider<HistoryNode> 
         tokenUsage: { ...node.tokenUsage },
       })),
       roots: [...this.roots],
-      headId: this.headId,
+      activeSessionId: this.activeSessionId,
+      headBySession,
     };
   }
 
@@ -164,6 +284,7 @@ export class HistoryTreeManager implements vscode.TreeDataProvider<HistoryNode> 
     for (const node of state.nodes) {
       this.nodes.set(node.id, {
         ...node,
+        sessionId: node.sessionId ?? 'default',
         childrenIds: [...node.childrenIds],
         tokenUsage: { ...node.tokenUsage },
       });
@@ -175,13 +296,89 @@ export class HistoryTreeManager implements vscode.TreeDataProvider<HistoryNode> 
       }
     }
 
-    if (state.headId && this.nodes.has(state.headId)) {
-      this.headId = state.headId;
-    } else {
-      this.headId = this.roots.length > 0 ? this.roots[this.roots.length - 1] : undefined;
+    this.headBySession.clear();
+    if (state.headBySession) {
+      for (const [sessionId, headId] of Object.entries(state.headBySession)) {
+        if (this.nodes.has(headId)) {
+          this.headBySession.set(sessionId, headId);
+        }
+      }
+    }
+
+    if (this.headBySession.size === 0) {
+      const legacyHeadId = (state as unknown as { headId?: string }).headId;
+      if (legacyHeadId && this.nodes.has(legacyHeadId)) {
+        const legacyNode = this.nodes.get(legacyHeadId)!;
+        this.headBySession.set(legacyNode.sessionId, legacyHeadId);
+      } else {
+        for (const rootId of this.roots) {
+          const rootNode = this.nodes.get(rootId);
+          if (rootNode && !this.headBySession.has(rootNode.sessionId)) {
+            this.headBySession.set(rootNode.sessionId, rootNode.id);
+          }
+        }
+      }
+    }
+
+    if (state.activeSessionId) {
+      this.activeSessionId = state.activeSessionId;
+    } else if (this.headBySession.size > 0) {
+      this.activeSessionId = this.headBySession.keys().next().value as string;
     }
 
     this.onDidChangeTreeDataEmitter.fire(undefined);
+  }
+
+  private getSessionItems(): SessionTreeItem[] {
+    const sessionIds = new Set<string>();
+    for (const node of this.nodes.values()) {
+      sessionIds.add(node.sessionId);
+    }
+
+    return Array.from(sessionIds.values())
+      .sort((left, right) => {
+        if (left === this.activeSessionId) {
+          return -1;
+        }
+        if (right === this.activeSessionId) {
+          return 1;
+        }
+        return left.localeCompare(right);
+      })
+      .map((sessionId) => ({
+        kind: 'session',
+        sessionId,
+        label: sessionId === this.activeSessionId
+          ? `${this.getSessionLabel(sessionId)} (active)`
+          : this.getSessionLabel(sessionId),
+      }));
+  }
+
+  private getSessionRoots(sessionId: string): HistoryNode[] {
+    return this.roots
+      .map((id) => this.nodes.get(id))
+      .filter((node): node is HistoryNode => !!node && node.sessionId === sessionId);
+  }
+
+  private isSessionItem(item: HistoryTreeItem): item is SessionTreeItem {
+    return (item as SessionTreeItem).kind === 'session';
+  }
+
+  private getSessionLabel(sessionId: string): string {
+    return this.sessionLabels.get(sessionId) ?? `Session ${sessionId.slice(0, 8)}`;
+  }
+
+  private recomputeSessionHeads(sessionId: string): void {
+    const sessionNodes = Array.from(this.nodes.values()).filter((node) => node.sessionId === sessionId);
+    if (sessionNodes.length === 0) {
+      this.headBySession.delete(sessionId);
+      return;
+    }
+
+    const newest = sessionNodes.reduce((best, current) =>
+      current.timestamp > best.timestamp ? current : best,
+    sessionNodes[0]);
+    this.headBySession.set(sessionId, newest.id);
   }
 
   private async ensureRepository(): Promise<void> {

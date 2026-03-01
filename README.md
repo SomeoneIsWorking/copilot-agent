@@ -42,6 +42,14 @@ Agentic coding extension with a persistent branching timeline, Copilot model acc
 
 Debug is configured for TypeScript watch mode via `.vscode/tasks.json` and `.vscode/launch.json`.
 
+## Live Model Test (Real Copilot Model)
+To run an end-to-end test using a real model (no fake model), run:
+- Command Palette → `Branching Timeline: Run Live Model Test`
+
+This command is registered only in **development mode** (Extension Development Host), not in production installs.
+
+This command temporarily switches Smart/Fast models to `raptor-mini-free`, asks the agent to inspect project files, and verifies that a `read_directory` tool call occurred.
+
 ## Notes
 - See `KNOWN_LIMITATIONS.md` for API/platform constraints.
 - See `TODO.md` for next recommended improvements.

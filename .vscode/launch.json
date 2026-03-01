@@ -14,16 +14,19 @@
       "preLaunchTask": "npm: watch"
     },
     {
-      "name": "Run Extension Tests",
+      "name": "Run Live Model Test (Auto)",
       "type": "extensionHost",
       "request": "launch",
       "args": [
-        "--extensionDevelopmentPath=${workspaceFolder}",
-        "--extensionTestsPath=${workspaceFolder}/out/test/index"
+        "--extensionDevelopmentPath=${workspaceFolder}"
       ],
       "outFiles": [
-        "${workspaceFolder}/out/test/**/*.js"
+        "${workspaceFolder}/out/**/*.js"
       ],
+      "env": {
+        "BRANCHING_TIMELINE_AUTORUN_LIVE_TEST": "1",
+        "BRANCHING_TIMELINE_LIVE_TEST_MODEL": "copilot-fast"
+      },
       "preLaunchTask": "npm: watch"
     }
   ]

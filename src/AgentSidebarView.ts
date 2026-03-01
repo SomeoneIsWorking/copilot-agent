@@ -1,8 +1,6 @@
 import * as vscode from 'vscode';
 import { AgentLoop } from './AgentLoop';
 import {
-  DEFAULT_FAST_MODEL,
-  DEFAULT_SMART_MODEL,
   SIDEBAR_SESSION_ID,
   getModelPreferences,
   setModelPreferences,
@@ -74,12 +72,7 @@ export class AgentSidebarViewProvider implements vscode.WebviewViewProvider {
       }
     });
 
-    const modelPrefs = getModelPreferences();
-    this.postMessage({
-      type: 'modelPrefs',
-      smartModel: modelPrefs.smart,
-      fastModel: modelPrefs.fast,
-    });
+    void this.postInitialModelData();
     this.postMessage({
       type: 'replaceMessages',
       messages: this.agentLoop.getSessionMessages(this.sessionId),
@@ -91,6 +84,20 @@ export class AgentSidebarViewProvider implements vscode.WebviewViewProvider {
     this.view?.webview.postMessage(message);
   }
 
+  private async postInitialModelData(): Promise<void> {
+    const modelPrefs = getModelPreferences();
+    const models = await this.agentLoop.listAvailableModels();
+    this.postMessage({
+      type: 'modelOptions',
+      options: models,
+    });
+    this.postMessage({
+      type: 'modelPrefs',
+      smartModel: modelPrefs.smart,
+      fastModel: modelPrefs.fast,
+    });
+  }
+
   private async setHtml(webview: vscode.Webview): Promise<void> {
     const nonce = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const templateUri = vscode.Uri.joinPath(this.extensionUri, 'media', 'agent-sidebar.html');
@@ -99,9 +106,7 @@ export class AgentSidebarViewProvider implements vscode.WebviewViewProvider {
 
     const html = template
       .replaceAll('__CSP_SOURCE__', webview.cspSource)
-      .replaceAll('__NONCE__', nonce)
-      .replaceAll('__DEFAULT_SMART_MODEL__', DEFAULT_SMART_MODEL)
-      .replaceAll('__DEFAULT_FAST_MODEL__', DEFAULT_FAST_MODEL);
+      .replaceAll('__NONCE__', nonce);
 
     webview.html = html;
   }

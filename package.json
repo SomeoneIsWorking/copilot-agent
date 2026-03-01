@@ -17,7 +17,23 @@
     "commands": [
       {
         "command": "branchingTimeline.rewindToNode",
-        "title": "Branching Timeline: Rewind to Node"
+        "title": "Rewind to this node",
+        "icon": "$(history)"
+      },
+      {
+        "command": "branchingTimeline.renameSession",
+        "title": "Rename session",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "branchingTimeline.deleteSession",
+        "title": "Delete session",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "branchingTimeline.deleteCheckpoint",
+        "title": "Delete checkpoint",
+        "icon": "$(trash)"
       }
     ],
     "viewsContainers": {
@@ -34,11 +50,13 @@
         {
           "id": "branchingTimeline.agentView",
           "name": "Agent",
-          "type": "webview"
+          "type": "webview",
+          "icon": "resources/timeline.svg"
         },
         {
           "id": "branchingTimeline.timelineView",
-          "name": "Branching Timeline"
+          "name": "Branching Timeline",
+          "icon": "resources/timeline.svg"
         }
       ]
     },
@@ -47,7 +65,22 @@
         {
           "command": "branchingTimeline.rewindToNode",
           "when": "view == branchingTimeline.timelineView && viewItem == timelineNode",
-          "group": "inline"
+          "group": "inline@1"
+        },
+        {
+          "command": "branchingTimeline.deleteCheckpoint",
+          "when": "view == branchingTimeline.timelineView && viewItem == timelineNode",
+          "group": "inline@2"
+        },
+        {
+          "command": "branchingTimeline.renameSession",
+          "when": "view == branchingTimeline.timelineView && viewItem == timelineSession",
+          "group": "inline@1"
+        },
+        {
+          "command": "branchingTimeline.deleteSession",
+          "when": "view == branchingTimeline.timelineView && viewItem == timelineSession",
+          "group": "inline@2"
         }
       ]
     },

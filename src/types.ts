@@ -7,6 +7,7 @@ export interface TokenUsage {
 
 export interface HistoryNode {
   id: string;
+  sessionId: string;
   messageId: string;
   gitHash: string;
   parentId?: string;
@@ -66,10 +67,19 @@ export interface CheckpointMetadata {
 export interface PersistedHistoryState {
   nodes: HistoryNode[];
   roots: string[];
-  headId?: string;
+  activeSessionId?: string;
+  headBySession?: Record<string, string>;
 }
 
 export interface PersistedAgentLoopState {
+  sessions?: AgentSession[];
   sessionMessages: Record<string, ChatMessage[]>;
   nodeSessionSnapshots: Record<string, ChatMessage[]>;
+}
+
+export interface AgentSession {
+  id: string;
+  label: string;
+  createdAt: number;
+  updatedAt: number;
 }

@@ -1,0 +1,91 @@
+{
+  "name": "branching-timeline-agent",
+  "displayName": "Branching Timeline Agent",
+  "description": "AI Agent with branching timeline, tool orchestration, and MCP support via vscode.lm",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.98.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "branchingTimeline.rewindToNode",
+        "title": "Branching Timeline: Rewind to Node"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "branchingTimeline",
+          "title": "Branching Timeline Agent",
+          "icon": "resources/timeline.svg"
+        }
+      ]
+    },
+    "views": {
+      "branchingTimeline": [
+        {
+          "id": "branchingTimeline.agentView",
+          "name": "Agent",
+          "type": "webview"
+        },
+        {
+          "id": "branchingTimeline.timelineView",
+          "name": "Branching Timeline"
+        }
+      ]
+    },
+    "menus": {
+      "view/item/context": [
+        {
+          "command": "branchingTimeline.rewindToNode",
+          "when": "view == branchingTimeline.timelineView && viewItem == timelineNode",
+          "group": "inline"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Branching Timeline Agent",
+      "properties": {
+        "branchingTimeline.models.smart": {
+          "type": "string",
+          "default": "gpt-5.3-codex",
+          "description": "Model id/name for deeper planning and reasoning."
+        },
+        "branchingTimeline.models.fast": {
+          "type": "string",
+          "default": "gemini-3-flash",
+          "description": "Model id/name for high-speed analysis/tool loops."
+        },
+        "branchingTimeline.toolApprovalMode": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "auto"
+          ],
+          "default": "auto",
+          "description": "Whether to require explicit confirmation before each native/MCP tool call."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "@types/vscode": "^1.98.0",
+    "typescript": "^5.8.2",
+    "vitest": "^2.1.8"
+  }
+}

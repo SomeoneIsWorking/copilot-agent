@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src __CSP_SOURCE__ 'unsafe-inline'; script-src 'nonce-__NONCE__';" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    body { margin: 0; padding: 8px; font-family: var(--vscode-font-family); }
+    .top { display: grid; grid-template-columns: 1fr; gap: 6px; margin-bottom: 8px; }
+    .modelGrid { display: grid; grid-template-columns: 1fr; gap: 6px; }
+    .modelRow { display: grid; grid-template-columns: 92px 1fr; gap: 6px; align-items: center; }
+    .modelRow input { width: 100%; box-sizing: border-box; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: 4px; padding: 6px; }
+    .messages { border: 1px solid var(--vscode-panel-border); border-radius: 6px; height: 240px; overflow: auto; padding: 8px; margin-bottom: 8px; }
+    .msg { margin-bottom: 8px; padding: 8px; border-radius: 6px; white-space: pre-wrap; }
+    .user { background: var(--vscode-editor-inactiveSelectionBackground); }
+    .assistant { background: var(--vscode-sideBar-background); border: 1px solid var(--vscode-panel-border); }
+    textarea { width: 100%; min-height: 78px; resize: vertical; box-sizing: border-box; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: 6px; padding: 8px; }
+    .row { display: grid; grid-template-columns: 1fr auto auto; gap: 6px; margin-top: 6px; }
+    button { border: none; border-radius: 4px; padding: 6px 10px; cursor: pointer; background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+    button.secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+    .status { font-size: 12px; opacity: 0.8; margin-bottom: 6px; }
+  </style>
+</head>
+<body>
+  <div class="top">
+    <div class="modelGrid">
+      <div class="modelRow">
+        <label for="smartModel">Smart</label>
+        <input id="smartModel" type="text" placeholder="__DEFAULT_SMART_MODEL__" />
+      </div>
+      <div class="modelRow">
+        <label for="fastModel">Fast</label>
+        <input id="fastModel" type="text" placeholder="__DEFAULT_FAST_MODEL__" />
+      </div>
+      <button id="saveModels" class="secondary">Apply Models</button>
+    </div>
+  </div>
+  <div id="status" class="status">Stopped</div>
+  <div id="messages" class="messages"></div>
+  <textarea id="prompt" placeholder="Ask the agent to inspect files, run tools, and edit code..."></textarea>
+  <div class="row">
+    <div></div>
+    <button id="send">Send</button>
+    <button id="stop" class="secondary">Hard Stop</button>
+  </div>
+
+  <script nonce="__NONCE__">
+    const vscode = acquireVsCodeApi();
+    const messagesEl = document.getElementById('messages');
+    const promptEl = document.getElementById('prompt');
+    const smartModelEl = document.getElementById('smartModel');
+    const fastModelEl = document.getElementById('fastModel');
+    const statusEl = document.getElementById('status');
+
+    function resetMessages() {
+      messagesEl.innerHTML = '';
+    }
+
+    function push(role, text) {
+      const el = document.createElement('div');
+      el.className = 'msg ' + role;
+      el.textContent = text;
+      messagesEl.appendChild(el);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    document.getElementById('send').addEventListener('click', () => {
+      const prompt = (promptEl.value || '').trim();
+      if (!prompt) return;
+      push('user', prompt);
+      promptEl.value = '';
+      vscode.postMessage({ type: 'runPrompt', prompt });
+    });
+
+    promptEl.addEventListener('keydown', (event) => {
+      if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+        document.getElementById('send').click();
+      }
+    });
+
+    document.getElementById('stop').addEventListener('click', () => {
+      vscode.postMessage({ type: 'hardStop' });
+    });
+
+    document.getElementById('saveModels').addEventListener('click', () => {
+      vscode.postMessage({
+        type: 'saveModels',
+        smartModel: (smartModelEl.value || '').trim(),
+        fastModel: (fastModelEl.value || '').trim(),
+      });
+    });
+
+    window.addEventListener('message', (event) => {
+      const msg = event.data;
+      if (msg?.type === 'assistantMessage') {
+        push('assistant', String(msg.content || ''));
+      }
+      if (msg?.type === 'state') {
+        statusEl.textContent = msg.state === 'thinking' ? 'Running' : 'Stopped';
+      }
+      if (msg?.type === 'modelPrefs') {
+        smartModelEl.value = String(msg.smartModel || '');
+        fastModelEl.value = String(msg.fastModel || '');
+      }
+      if (msg?.type === 'replaceMessages') {
+        resetMessages();
+        const items = Array.isArray(msg.messages) ? msg.messages : [];
+        for (const item of items) {
+          if (!item || typeof item !== 'object') continue;
+          const role = item.role === 'user' ? 'user' : 'assistant';
+          const content = typeof item.content === 'string' ? item.content : '';
+          push(role, content);
+        }
+      }
+    });
+  </script>
+</body>
+</html>

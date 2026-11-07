@@ -53,3 +53,5 @@ This command temporarily switches Smart/Fast models to `raptor-mini-free`, asks 
 ## Notes
 - See `KNOWN_LIMITATIONS.md` for API/platform constraints.
 - See `TODO.md` for next recommended improvements.
+
+Built with AI assistance (Claude and other LLMs).
